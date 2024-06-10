@@ -7,7 +7,7 @@
 const path = __nccwpck_require__(1017);
 const core = __nccwpck_require__(2186);
 const { CodeDeploy, waitUntilDeploymentSuccessful } = __nccwpck_require__(6692);
-const { ECS, waitUntilServicesStable } = __nccwpck_require__(8209);
+const { ECS, RunTaskCommand, DescribeTasksCommand, waitUntilServicesStable } = __nccwpck_require__(8209);
 const yaml = __nccwpck_require__(4083);
 const fs = __nccwpck_require__(7147);
 const crypto = __nccwpck_require__(6113);
@@ -26,6 +26,112 @@ const IGNORED_TASK_DEFINITION_ATTRIBUTES = [
   'deregisteredAt',
   'registeredBy'
 ];
+// Run task outside of a service
+async function runTask(ecs, clusterName, taskDefArn, waitForMinutes) {
+  core.info('Running task');
+
+  const waitForTask = core.getInput('wait-for-task-stopped', { required: false }) || 'false';
+  const startedBy = core.getInput('run-task-started-by', { required: false }) || 'GitHub-Actions';
+  const launchType = core.getInput('run-task-launch-type', { required: false }) || 'FARGATE';
+  const subnetIds = core.getInput('run-task-subnets', { required: false }) || '';
+  const securityGroupIds = core.getInput('run-task-security-groups', { required: false }) || '';
+  const containerOverrides = JSON.parse(core.getInput('run-task-container-overrides', { required: false }) || '[]');
+  let awsvpcConfiguration = {};
+
+  if (subnetIds != "") {
+    awsvpcConfiguration["subnets"] = subnetIds.split(',');
+  }
+
+  if (securityGroupIds != "") {
+    awsvpcConfiguration["securityGroups"] = securityGroupIds.split(',');
+  }
+
+  const runTaskInput = {
+    startedBy: startedBy,
+    cluster: clusterName,
+    taskDefinition: taskDefArn,
+    overrides: {
+      containerOverrides: containerOverrides
+    },
+    launchType: launchType,
+    networkConfiguration: Object.keys(awsvpcConfiguration).length === 0 ? {} : { awsvpcConfiguration: awsvpcConfiguration }
+  };
+  const command = new RunTaskCommand(runTaskInput);
+  const runTaskResponse = await ecs.send(command);
+
+  core.debug(`Run task response ${JSON.stringify(runTaskResponse)}`);
+
+  const taskArns = runTaskResponse.tasks.map(task => task.taskArn);
+  core.setOutput('run-task-arn', taskArns);
+
+  if (runTaskResponse.failures && runTaskResponse.failures.length > 0) {
+    const failure = runTaskResponse.failures[0];
+    throw new Error(`${failure.arn} is ${failure.reason}`);
+  }
+
+  // Wait for task to end
+  if (waitForTask && waitForTask.toLowerCase() === "true") {
+    await waitForTasksStopped(ecs, clusterName, taskArns, waitForMinutes);
+  } else {
+    core.debug('Not waiting for the task to stop');
+  }
+}
+
+// Poll tasks until they enter a stopped state
+async function waitForTasksStopped(ecs, clusterName, taskArns, waitForMinutes) {
+  const startTime = Date.now();
+  const maxWaitTime = waitForMinutes * 60 * 1000;
+  const waitInterval = 30000; // 30 seconds
+
+  core.info(`Waiting for tasks to stop. Will wait for ${waitForMinutes} minutes`);
+
+  while ((Date.now() - startTime) < maxWaitTime) {
+    const describeInput = {
+      cluster: clusterName,
+      tasks: taskArns
+    };
+    const command = new DescribeTasksCommand(describeInput);
+    const describeResponse = await ecs.send(command);
+
+    const stoppedTasks = describeResponse.tasks.filter(task => task.lastStatus === 'STOPPED');
+    if (stoppedTasks.length === taskArns.length) {
+      core.info('All tasks have stopped.');
+      await checkTasksExitCode(ecs, clusterName, taskArns);
+      return;
+    }
+
+    await new Promise(resolve => setTimeout(resolve, waitInterval));
+  }
+
+  throw new Error(`Tasks did not stop within ${waitForMinutes} minutes`);
+}
+
+// Check a task's exit code and fail the job on error
+async function checkTasksExitCode(ecs, clusterName, taskArns) {
+  const describeInput = {
+    cluster: clusterName,
+    tasks: taskArns
+  };
+  const command = new DescribeTasksCommand(describeInput);
+  const describeResponse = await ecs.send(command);
+
+  const containers = [].concat(...describeResponse.tasks.map(task => task.containers));
+  const exitCodes = containers.map(container => container.exitCode);
+  const reasons = containers.map(container => container.reason);
+
+  const failuresIdx = [];
+
+  exitCodes.forEach((exitCode, index) => {
+    if (exitCode !== 0) {
+      failuresIdx.push(index);
+    }
+  });
+
+  const failures = reasons.filter((_, index) => failuresIdx.indexOf(index) !== -1);
+  if (failures.length > 0) {
+    throw new Error(`Run task failed: ${JSON.stringify(failures)}`);
+  }
+}
 
 // Deploy to a service that uses the 'ECS' deployment controller
 async function updateEcsService(ecs, clusterName, service, taskDefArn, waitForService, waitForMinutes, forceNewDeployment, desiredCount) {
@@ -307,10 +413,18 @@ async function run() {
     const taskDefArn = registerResponse.taskDefinition.taskDefinitionArn;
     core.setOutput('task-definition-arn', taskDefArn);
 
+    // Run the task outside of the service
+    const clusterName = cluster ? cluster : 'default';
+    const shouldRunTaskInput = core.getInput('run-task', { required: false }) || 'false';
+    const shouldRunTask = shouldRunTaskInput.toLowerCase() === 'true';
+    core.debug(`shouldRunTask: ${shouldRunTask}`);
+    if (shouldRunTask) {
+      core.debug("Running ad-hoc task...");
+      await runTask(ecs, clusterName, taskDefArn, waitForMinutes);
+    }
+
     // Update the service with the new task definition
     if (service) {
-      const clusterName = cluster ? cluster : 'default';
-
       // Determine the deployment controller
       const describeResponse = await ecs.describeServices({
         services: [service],

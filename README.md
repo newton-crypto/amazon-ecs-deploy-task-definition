@@ -6,12 +6,14 @@ Registers an Amazon ECS task definition and deploys it to an ECS service.
 
 <!-- toc -->
 
+- [Amazon ECS "Deploy Task Definition" Action for GitHub Actions](#amazon-ecs-deploy-task-definition-action-for-github-actions)
 - [Usage](#usage)
-    + [Task definition file](#task-definition-file)
-    + [Task definition container image values](#task-definition-container-image-values)
+  - [Task definition file](#task-definition-file)
+  - [Task definition container image values](#task-definition-container-image-values)
 - [Credentials and Region](#credentials-and-region)
 - [Permissions](#permissions)
 - [AWS CodeDeploy Support](#aws-codedeploy-support)
+- [Running Tasks](#running-tasks)
 - [Troubleshooting](#troubleshooting)
 - [License Summary](#license-summary)
 - [Security Disclosures](#security-disclosures)
@@ -221,6 +223,26 @@ The minimal permissions require access to CodeDeploy:
    ]
 }
 ```
+
+## Running Tasks
+
+For services which need an initialization task, such as database migrations, or ECS tasks that are run without a service, additional configuration can be added to trigger an ad-hoc task run. When combined with GitHub Action's `on: schedule` triggers, runs can also be scheduled without EventBridge.
+
+In the following example, the service would not be updated until the ad-hoc task exits successfully.
+
+```yaml
+    - name: Deploy to Amazon ECS
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        service: my-service
+        cluster: my-cluster
+        wait-for-service-stability: true
+        run-task: true
+        wait-for-task-stopped: true
+```
+
+Overrides and VPC networking options are available as well. See [actions.yml](actions.yml) for more details.
 
 ## Troubleshooting
 
